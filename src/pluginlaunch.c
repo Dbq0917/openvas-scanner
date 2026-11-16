@@ -26,6 +26,7 @@
 #include <errno.h>          /* for errno() */
 #include <gvm/base/prefs.h> /* for prefs_get_bool() */
 #include <gvm/util/nvticache.h>
+#include <signal.h> /* for sigprocmask() */
 #include <stdio.h>  /* for perror() */
 #include <stdlib.h> /* for atoi() */
 #include <string.h>
@@ -103,6 +104,27 @@ max_nvt_timeouts_reached (void)
 }
 
 /**
+ * @brief Check if a running process has reached its NVT timeout.
+ *
+ * @param process The running process.
+ * @param now     The current time.
+ *
+ * @return TRUE if the process timed out, FALSE otherwise.
+ */
+static gboolean
+process_timed_out (const struct running *process, const struct timeval *now)
+{
+  gint64 elapsed;
+
+  if (process->timeout <= 0)
+    return FALSE;
+
+  elapsed = ((gint64) now->tv_sec - process->start.tv_sec) * G_USEC_PER_SEC
+            + (now->tv_usec - process->start.tv_usec);
+  return elapsed >= (gint64) process->timeout * G_USEC_PER_SEC;
+}
+
+/**
  *
  */
 static void
@@ -124,10 +146,7 @@ update_running_processes (kb_t main_kb, kb_t kb)
           int ret_terminate = 0;
 
           // If process dead or timed out
-          if (!is_alive
-              || (processes[i].timeout > 0
-                  && ((now.tv_sec - processes[i].start.tv_sec)
-                      > processes[i].timeout)))
+          if (!is_alive || process_timed_out (&processes[i], &now))
             {
               char *oid = processes[i].plugin->oid;
 
@@ -511,35 +530,104 @@ plugin_launch (struct scan_globals *globals, struct scheduler_plugin *plugin,
 }
 
 /**
+ * @brief Get the time until the next running process reaches its timeout.
+ *
+ * @param[out] timeout Time until the nearest timeout.
+ *
+ * @return TRUE if a timeout was found, FALSE otherwise.
+ */
+static gboolean
+next_process_timeout (struct timespec *timeout)
+{
+  int i;
+  gboolean found = FALSE;
+  gint64 shortest_remaining = 0;
+  struct timeval now;
+
+  gettimeofday (&now, NULL);
+  for (i = 0; i < MAX_PROCESSES; i++)
+    {
+      gint64 elapsed, remaining;
+
+      if (processes[i].pid <= 0 || processes[i].timeout <= 0)
+        continue;
+
+      elapsed =
+        ((gint64) now.tv_sec - processes[i].start.tv_sec) * G_USEC_PER_SEC
+        + (now.tv_usec - processes[i].start.tv_usec);
+      remaining = (gint64) processes[i].timeout * G_USEC_PER_SEC - elapsed;
+      if (remaining < 0)
+        remaining = 0;
+      if (!found || remaining < shortest_remaining)
+        {
+          found = TRUE;
+          shortest_remaining = remaining;
+        }
+    }
+
+  if (!found)
+    return FALSE;
+
+  timeout->tv_sec = shortest_remaining / G_USEC_PER_SEC;
+  timeout->tv_nsec = (shortest_remaining % G_USEC_PER_SEC) * 1000;
+  return TRUE;
+}
+
+/**
+ * @brief Wait for a child event or the next NVT timeout.
+ *
+ * Handles scan stop requests and cleans up finished processes.
+ */
+static void
+wait_for_process_event (kb_t main_kb, kb_t kb)
+{
+  sigset_t mask, oldmask;
+  struct timespec ts;
+  int sig = 0;
+
+  sigemptyset (&mask);
+  sigaddset (&mask, SIGCHLD);
+  sigaddset (&mask, SIGUSR1);
+
+  if (sigprocmask (SIG_BLOCK, &mask, &oldmask) < 0)
+    {
+      g_warning ("%s: %s (%d)", __func__, strerror (errno), errno);
+      return;
+    }
+
+  update_running_processes (main_kb, kb);
+  if (num_running_processes)
+    {
+      if (next_process_timeout (&ts))
+        sig = sigtimedwait (&mask, NULL, &ts);
+      else
+        sig = sigwaitinfo (&mask, NULL);
+    }
+
+  if (sigprocmask (SIG_SETMASK, &oldmask, NULL) < 0)
+    g_warning ("%s: %s (%d)", __func__, strerror (errno), errno);
+
+  if (sig < 0 && errno != EAGAIN && errno != EINTR)
+    g_warning ("%s: %s (%d)", __func__, strerror (errno), errno);
+  else if (sig == SIGUSR1)
+    pluginlaunch_stop ();
+
+  // cleanup ipcc cache
+  procs_cleanup_children ();
+  update_running_processes (main_kb, kb);
+}
+
+/**
  * @brief Waits and 'pushes' processes until num_running_processes is 0.
+ *
+ * Do not block in waitpid() here. If only a timed-out NVT remains, no child
+ * event wakes the parent and the timeout would never be enforced.
  */
 void
 pluginlaunch_wait (kb_t main_kb, kb_t kb)
 {
   while (num_running_processes)
-    {
-      update_running_processes (main_kb, kb);
-      if (num_running_processes)
-        waitpid (-1, NULL, 0);
-    }
-}
-
-/**
- * @brief Return shortest timeout of the running processes.
- */
-static int
-timeout_running_processes (void)
-{
-  int i, timeout = 0;
-
-  for (i = 0; i < MAX_PROCESSES; i++)
-    {
-      if (processes[i].pid <= 0)
-        continue;
-      if (!timeout || processes[i].timeout < timeout)
-        timeout = processes[i].timeout;
-    }
-  return timeout;
+    wait_for_process_event (main_kb, kb);
 }
 
 /**
@@ -568,31 +656,7 @@ pluginlaunch_wait_for_free_process (kb_t main_kb, kb_t kb)
     (num_running_processes >= max_running_processes)
     || (num_running_processes > 0 && (check_memory () || check_sysload ())))
     {
-      sigset_t mask;
-      struct timespec ts = {0, 0};
-
-      ts.tv_sec = timeout_running_processes ();
-      assert (ts.tv_sec);
-      sigemptyset (&mask);
-      sigaddset (&mask, SIGCHLD);
-      sigaddset (&mask, SIGUSR1);
-      /* Wait here for the shortest plugins timeout or for a child which ended.
-       * Also, it handles signal SIGUSR1 to stop a scan. Otherwise the signa is
-       * ignored, the plugin is never stopped and the scanner keeps waiting. */
-      int sig = sigtimedwait (&mask, NULL, &ts);
-      if (sig < 0 && errno != EAGAIN)
-        g_warning ("%s: %s (%d)", __func__, strerror (errno), errno);
-      else if (sig == SIGUSR1)
-        {
-          /* SIGUSR1 signal is sent during scan stop to all host processes.
-             Therefore pluginlaunch_stop() is called here, for the
-             special case in which we are waiting for the last plugin, of the
-             last host, to finish.
-          */
-          pluginlaunch_stop ();
-        }
-      // cleanup ipcc cache
-      procs_cleanup_children ();
-      update_running_processes (main_kb, kb);
+      /* Wait for a child event or the next NVT timeout. */
+      wait_for_process_event (main_kb, kb);
     }
 }
